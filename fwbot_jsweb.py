@@ -1,13 +1,14 @@
 from telethon.tl.types import InputPeerUser, InputPeerChannel, PeerChat, PeerChannel
 from telethon import TelegramClient, sync, events, errors
 from telethon.errors import FloodWaitError
-from telethon.sessions import StringSession          # 新增导入
+from telethon.sessions import StringSession
 import sys, asyncio, traceback
 import queue, time, json, os, re
 from datetime import datetime, timezone, timedelta
 import threading
 import http.server
 import collections
+from urllib.parse import urlparse, parse_qs
 
 # ---------- 全局日志存储 ----------
 log_buffer = collections.deque(maxlen=15)
@@ -24,7 +25,7 @@ def log(msg):
 
 
 def configfile(file_path):
-    """读取 JSON 文件并返回解析后的数据"""
+    """读取 JSON 配置文件并返回解析后的数据"""
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -35,6 +36,7 @@ def configfile(file_path):
         log(f"错误：JSON 解析失败 - {e}")
     except Exception as e:
         log(f"其他错误：{e}")
+    return None
 
 
 class TelegramMessageForwarder:
@@ -55,6 +57,9 @@ class TelegramMessageForwarder:
 
     async def initialize(self):
         result = configfile(self.config_path)
+        if not result:
+            raise Exception("无法读取配置文件")
+
         api_id = result['api_id']
         api_hash = result['api_hash']
         string_session = result.get('string_session')
@@ -85,15 +90,17 @@ class TelegramMessageForwarder:
     def build_condition(self):
         conditions = []
         result = configfile(self.config_path)
-        condition_fw = result['condition_fw']
+        condition_fw = result.get('condition_fw', 'yes')
 
-        for key in result["conditions_sth"]:
+        # 简单关键词存在性检查
+        for key in result.get("conditions_sth", {}):
             if condition_fw == "yes":
                 conditions.append(f"'{key}' in msg")
             else:
                 conditions.append(f"'{key}' not in msg")
 
-        for key, value in result["conditions_ext"].items():
+        # 扩展条件（字段等于某值）
+        for key, value in result.get("conditions_ext", {}).items():
             key_clean = key.strip("'\"")
             if value is None:
                 val_repr = "None"
@@ -124,7 +131,7 @@ class TelegramMessageForwarder:
                 msg = event.message.raw_text
                 log(f'收到消息: {datetime.now()}, 内容: {msg}')
                 if_condition = self.build_condition()
-                log(f'{datetime.now()} if_condition 过滤条件: {if_condition}')
+                log(f'{datetime.now()} 过滤条件: {if_condition}')
                 if eval(if_condition):
                     log("符合转发条件，正在转发...")
                     await self.client.forward_messages(
@@ -134,7 +141,7 @@ class TelegramMessageForwarder:
                     )
                     event_time = self.get_beijing_time(event.date)
                     current_time = self.get_beijing_time()
-                    log(f"转发完成 {event_time} {current_time}")
+                    log(f"转发完成 消息时间:{event_time} 当前时间:{current_time}")
                 else:
                     log("不符合转发条件，跳过")
                 break
@@ -166,10 +173,10 @@ class TelegramMessageForwarder:
                 await asyncio.sleep(30)
                 if self.client.is_connected():
                     current_time = self.get_beijing_time()
-                    log(f"{current_time}✅ Telegram 连接正常")
+                    log(f"{current_time} ✅ Telegram 连接正常")
                 else:
                     current_time = self.get_beijing_time()
-                    log(f"{current_time}❌ Telegram 连接已断开")
+                    log(f"{current_time} ❌ Telegram 连接已断开")
 
         status_task = asyncio.create_task(print_connection_status())
         log("开始监控消息...")
@@ -179,10 +186,24 @@ class TelegramMessageForwarder:
             status_task.cancel()
 
 
-# ---------- HTTP 请求处理器 ----------
+# ---------- HTTP 状态服务 ----------
 class StatusHandler(http.server.BaseHTTPRequestHandler):
+    # 通过类属性传递密码
+    web_passwd = None
+
     def do_GET(self):
-        if self.path == '/status':
+        parsed_path = urlparse(self.path)
+        if parsed_path.path == '/status':
+            qs = parse_qs(parsed_path.query)
+            pass_input = qs.get('pass', [None])[0]
+
+            if self.web_passwd and pass_input != self.web_passwd:
+                self.send_response(403)
+                self.send_header('Content-type', 'text/plain; charset=utf-8')
+                self.end_headers()
+                self.wfile.write("密码错误，拒绝访问\n".encode('utf-8'))
+                return
+
             self.send_response(200)
             self.send_header('Content-type', 'text/plain; charset=utf-8')
             self.end_headers()
@@ -199,13 +220,15 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b'Not Found')
 
     def log_message(self, format, *args):
-        # 抑制 HTTP 服务器自身的日志输出，避免干扰主日志
+        # 抑制 HTTP 服务器自身的访问日志
         pass
 
 
-def start_http_server():
-    server = http.server.HTTPServer(('localhost', 8080), StatusHandler)
-    log("HTTP 状态服务已启动：http://localhost:8080/status")
+def start_http_server(web_passwd):
+    StatusHandler.web_passwd = web_passwd
+    port = int(os.environ.get('PORT', 8080))
+    server = http.server.HTTPServer(('0.0.0.0', port), StatusHandler)
+    log(f"HTTP 状态服务已启动，监听 0.0.0.0:{port}，访问 /status?pass=你的密码")
     server.serve_forever()
 
 
@@ -216,8 +239,14 @@ def main():
 
     config_path = os.path.join(directory, "fwbot.json")
 
-    # 启动 HTTP 服务器线程
-    http_thread = threading.Thread(target=start_http_server, daemon=True)
+    # 提前读取配置获取网页密码（若存在）
+    config_data = configfile(config_path)
+    web_passwd = ''
+    if config_data:
+        web_passwd = config_data.get('web_passwd', '')
+
+    # 启动 HTTP 服务器线程（守护线程，随主程序退出而终止）
+    http_thread = threading.Thread(target=start_http_server, args=(web_passwd,), daemon=True)
     http_thread.start()
 
     async def run():
