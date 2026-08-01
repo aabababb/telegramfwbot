@@ -44,6 +44,8 @@ class TelegramMessageForwarder:
         self.config_path = config_path
         self.private_group_id = None
         self.client = None
+        semaphore = asyncio.Semaphore(5)  # 最多同时处理 5 条消息
+
 
     def get_beijing_time(self, dt=None):
         """获取北京时间"""
@@ -160,13 +162,18 @@ class TelegramMessageForwarder:
         result = configfile(self.config_path)
         channel_username = result['channel_username']
 
+        async def limited_handler(event):
+            async with semaphore:
+                await self.handle_message(event)
+
         @self.client.on(events.NewMessage(chats=[channel_username]))
-        async def new_message_handler(event):
-            await self.handle_message(event)
+        async def new_handler(event):
+            await limited_handler(event)        
 
         @self.client.on(events.MessageEdited(chats=[channel_username]))
         async def edited_message_handler(event):
-            await self.handle_message(event)
+            await limited_handler(event) 
+
 
         async def print_connection_status():
             while True:
@@ -184,6 +191,8 @@ class TelegramMessageForwarder:
             await self.client.run_until_disconnected()
         finally:
             status_task.cancel()
+
+       
 
 
 # ---------- HTTP 状态服务 ----------
